@@ -1,10 +1,10 @@
 import os
 import json
 import base64
-from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+import psycopg2
 
 app = FastAPI()
 
@@ -22,6 +22,14 @@ def get_google_service():
 
     creds = Credentials.from_authorized_user_info(info, SCOPES)
     return build("calendar", "v3", credentials=creds)
+
+
+def get_db_connection():
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url or not database_url.strip():
+        raise RuntimeError("DATABASE_URL não configurado no Railway")
+
+    return psycopg2.connect(database_url)
 
 
 @app.get("/health")
@@ -54,8 +62,32 @@ async def booking_created(request: Request):
     }
 
     created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+    google_event_id = created.get("id")
 
-    return {"status": "created", "booking_id": booking_id, "google_event_id": created.get("id")}
+    if not google_event_id:
+        raise HTTPException(status_code=500, detail="Google não retornou o id do evento")
+
+    # salva no Postgres
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # IMPORTANTe: isso exige que booking_id seja UNIQUE ou PRIMARY KEY no banco
+    cur.execute(
+        """
+        INSERT INTO appointments (booking_id, google_event_id, status)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (booking_id) DO UPDATE
+        SET google_event_id = EXCLUDED.google_event_id,
+            status = EXCLUDED.status
+        """,
+        (booking_id, google_event_id, "created"),
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"status": "created", "booking_id": booking_id, "google_event_id": google_event_id}
 
 
 @app.post("/booking-canceled")
@@ -66,6 +98,4 @@ async def booking_canceled(request: Request):
     if not booking_id:
         raise HTTPException(status_code=400, detail="booking_id ausente")
 
-    # Por enquanto, só confirma recebimento.
-    # A parte de deletar exige buscar o google_event_id no Postgres (vamos fazer isso depois).
     return {"status": "received", "booking_id": booking_id}
