@@ -1,6 +1,8 @@
 import os
 import json
 import base64
+import logging
+from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Request, HTTPException
@@ -8,6 +10,12 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import psycopg2
+
+# ============================================================
+# APP + LOG
+# ============================================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("app")
 
 app = FastAPI()
 
@@ -57,6 +65,10 @@ def normalize_to_rfc3339(dt_str: str) -> str:
     if not s:
         return ""
 
+    # trava placeholders (quando o Zaia não substitui a variável)
+    if "@data." in s or "{{" in s or "}}" in s:
+        raise ValueError(f"start_time inválido (variável não renderizada): {s}")
+
     if " " in s and "T" not in s:
         s = s.replace(" ", "T", 1)
 
@@ -80,6 +92,30 @@ def normalize_to_rfc3339(dt_str: str) -> str:
     return dt.isoformat()
 
 
+# ============================================================
+# NOVO: leitura segura do body (JSON ou FORM)
+# ============================================================
+async def read_body_any(request: Request) -> dict:
+    content_type = (request.headers.get("content-type") or "").lower()
+    raw = await request.body()
+
+    logger.info("request content-type=%s body_len=%s", content_type, len(raw))
+
+    if not raw:
+        raise HTTPException(status_code=400, detail=f"Body vazio. content-type={content_type}")
+
+    # tenta JSON mesmo se content-type vier errado
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        # tenta FORM
+        try:
+            form = await request.form()
+            return dict(form)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Body inválido (não é JSON nem FORM). content-type={content_type}")
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -87,9 +123,14 @@ async def health():
 
 @app.post("/booking-created")
 async def booking_created(request: Request):
-    data = await request.json()
+    # ✅ TROCA AQUI: não usa mais await request.json() direto
+    data = await read_body_any(request)
 
-    booking_id = data.get("booking_id") or data.get("id")
+    # ✅ booking_id agora é opcional (se não vier, a gente cria)
+    booking_id = (data.get("booking_id") or data.get("id") or "").strip()
+    if not booking_id:
+        booking_id = str(uuid4())
+
     client_name = data.get("client_name") or data.get("name") or "Cliente"
     service_name = data.get("service") or data.get("servico") or ""
 
@@ -98,20 +139,26 @@ async def booking_created(request: Request):
 
     client_phone = data.get("phone") or data.get("client_phone") or data.get("telefone")
 
-    if not booking_id:
-        raise HTTPException(status_code=400, detail="booking_id ausente")
     if not raw_start:
-        raise HTTPException(status_code=400, detail="start_time ausente (ou start)")
+        raise HTTPException(status_code=422, detail="start_time ausente (ou start)")
 
-    start_time = normalize_to_rfc3339(raw_start)
+    # ✅ se vier placeholder, agora vira 422 com mensagem clara
+    try:
+        start_time = normalize_to_rfc3339(raw_start)
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+
     if not start_time:
-        raise HTTPException(status_code=400, detail="start_time inválido")
+        raise HTTPException(status_code=422, detail="start_time inválido")
 
     # end_time opcional: calcula se não vier
     if raw_end:
-        end_time = normalize_to_rfc3339(raw_end)
+        try:
+            end_time = normalize_to_rfc3339(raw_end)
+        except ValueError as ve:
+            raise HTTPException(status_code=422, detail=str(ve))
         if not end_time:
-            raise HTTPException(status_code=400, detail="end_time inválido")
+            raise HTTPException(status_code=422, detail="end_time inválido")
     else:
         duration = calc_duration_min(service_name)
         dt_start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
@@ -179,9 +226,10 @@ async def booking_created(request: Request):
 
 @app.post("/booking-canceled")
 async def booking_canceled(request: Request):
-    data = await request.json()
-    booking_id = data.get("booking_id") or data.get("id")
+    # aqui também pode vir body “estranho”, então usa o mesmo leitor seguro
+    data = await read_body_any(request)
 
+    booking_id = (data.get("booking_id") or data.get("id") or "").strip()
     if not booking_id:
         raise HTTPException(status_code=400, detail="booking_id ausente")
 
