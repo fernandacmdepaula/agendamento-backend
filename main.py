@@ -47,10 +47,18 @@ async def booking_created(request: Request):
     start_time = data.get("start_time") or data.get("start")
     end_time = data.get("end_time") or data.get("end")
 
+    # dados extras (para lembrete)
+    start_at = (start_time or "").strip()
+    start_date = start_at.split(" ")[0] if " " in start_at else start_at
+    client_phone = data.get("phone") or data.get("client_phone") or data.get("telefone")
+
     if not booking_id:
         raise HTTPException(status_code=400, detail="booking_id ausente")
     if not start_time or not end_time:
-        raise HTTPException(status_code=400, detail="start_time/end_time ausentes (ou start/end)")
+        raise HTTPException(
+            status_code=400,
+            detail="start_time/end_time ausentes (ou start/end)",
+        )
 
     # 1) cria no Google Calendar
     service = get_google_service()
@@ -72,16 +80,28 @@ async def booking_created(request: Request):
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # precisa do booking_id com UNIQUE/PK para ON CONFLICT funcionar
+    # OBS: ON CONFLICT só funciona se booking_id tiver UNIQUE/PK
     cur.execute(
         """
-        INSERT INTO appointments (booking_id, google_event_id, status)
-        VALUES (%s, %s, %s)
+        INSERT INTO appointments (
+            booking_id,
+            google_event_id,
+            status,
+            client_phone,
+            start_date,
+            start_at,
+            reminder_sent,
+            reminder_sent_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, false, NULL)
         ON CONFLICT (booking_id) DO UPDATE
         SET google_event_id = EXCLUDED.google_event_id,
-            status = EXCLUDED.status
+            status = EXCLUDED.status,
+            client_phone = EXCLUDED.client_phone,
+            start_date = EXCLUDED.start_date,
+            start_at = EXCLUDED.start_at
         """,
-        (booking_id, google_event_id, "created"),
+        (booking_id, google_event_id, "created", client_phone, start_date, start_at),
     )
 
     conn.commit()
@@ -117,11 +137,19 @@ async def booking_canceled(request: Request):
     service = get_google_service()
     service.events().delete(calendarId=CALENDAR_ID, eventId=google_event_id).execute()
 
-    # 3) atualiza status
-    cur.execute("UPDATE appointments SET status = %s WHERE booking_id = %s", ("canceled", booking_id))
+    # 3) atualiza status (e garante que lembrete não será enviado)
+    cur.execute(
+        """
+        UPDATE appointments
+        SET status = %s
+        WHERE booking_id = %s
+        """,
+        ("canceled", booking_id),
+    )
     conn.commit()
 
     cur.close()
     conn.close()
 
     return {"status": "deleted", "booking_id": booking_id, "google_event_id": google_event_id}
+
