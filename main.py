@@ -1,37 +1,41 @@
+import os
+import json
+import base64
 from datetime import datetime, timedelta, timezone
+
+from fastapi import FastAPI, Request, HTTPException
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import psycopg2
+
+app = FastAPI()
+
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+CALENDAR_ID = os.getenv("CALENDAR_ID", "primary")
 
 BH_TZ = timezone(timedelta(hours=-3))
 
-def normalize_dt(dt_str: str) -> str:
-    """
-    Aceita:
-      - 'YYYY-MM-DD HH:MM:SS'
-      - 'YYYY-MM-DDTHH:MM:SS'
-      - já com timezone
-    Retorna sempre RFC3339 com timezone (-03:00) se não vier.
-    """
-    s = (dt_str or "").strip()
-    if not s:
-        return ""
 
-    # Se vier com espaço, troca por T
-    if " " in s and "T" not in s:
-        s = s.replace(" ", "T", 1)
+def get_google_service():
+    b64 = os.getenv("TOKEN_JSON_B64")
+    if not b64 or not b64.strip():
+        raise RuntimeError("TOKEN_JSON_B64 não configurado no Railway")
 
-    # Se já tem timezone (Z ou +hh:mm ou -hh:mm), devolve como está
-    if s.endswith("Z") or ("+" in s[10:] or "-" in s[10:]):
-        return s
+    token_str = base64.b64decode(b64).decode("utf-8")
+    info = json.loads(token_str)
 
-    # Não tem timezone: assume BH (-03:00)
-    # Tenta parse com segundos
-    try:
-        dt = datetime.fromisoformat(s)  # aceita 'YYYY-MM-DDTHH:MM:SS'
-    except ValueError:
-        # fallback sem segundos
-        dt = datetime.strptime(s, "%Y-%m-%dT%H:%M")
+    creds = Credentials.from_authorized_user_info(info, SCOPES)
+    return build("calendar", "v3", credentials=creds)
 
-    dt = dt.replace(tzinfo=BH_TZ)
-    return dt.isoformat()
+
+def get_db_connection():
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url or not database_url.strip():
+        raise RuntimeError("DATABASE_URL não configurado no Railway")
+
+    return psycopg2.connect(database_url)
+
 
 def calc_duration_min(service: str) -> int:
     s = (service or "").lower()
@@ -45,8 +49,40 @@ def calc_duration_min(service: str) -> int:
         return 20
     if "infantil" in s:
         return 35
-    # padrão
     return 40
+
+
+def normalize_to_rfc3339(dt_str: str) -> str:
+    s = (dt_str or "").strip()
+    if not s:
+        return ""
+
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
+
+    # já tem timezone?
+    tail = s[10:]
+    if s.endswith("Z") or ("+" in tail) or ("-" in tail and "T" in s):
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            dt = datetime.strptime(s, "%Y-%m-%dT%H:%M%z")
+        return dt.isoformat()
+
+    # sem timezone -> assume BH
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        dt = datetime.strptime(s, "%Y-%m-%dT%H:%M")
+    dt = dt.replace(tzinfo=BH_TZ)
+    return dt.isoformat()
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 @app.post("/booking-created")
@@ -67,30 +103,28 @@ async def booking_created(request: Request):
     if not raw_start:
         raise HTTPException(status_code=400, detail="start_time ausente (ou start)")
 
-    # Normaliza start
-    start_time = normalize_dt(raw_start)
+    start_time = normalize_to_rfc3339(raw_start)
     if not start_time:
         raise HTTPException(status_code=400, detail="start_time inválido")
 
-    # Se não vier end_time, calcula automaticamente
+    # end_time opcional: calcula se não vier
     if raw_end:
-        end_time = normalize_dt(raw_end)
+        end_time = normalize_to_rfc3339(raw_end)
         if not end_time:
             raise HTTPException(status_code=400, detail="end_time inválido")
     else:
-        # calcula end = start + duração
-        dt_start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
         duration = calc_duration_min(service_name)
+        dt_start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
         dt_end = dt_start + timedelta(minutes=duration)
         end_time = dt_end.isoformat()
 
-    # Para salvar no banco (texto simples)
-    start_at = start_time.replace("T", " ").split("+")[0].split("-03:00")[0].split("Z")[0]
-    start_date = start_at.split(" ")[0] if " " in start_at else start_at
+    # salvar no banco
+    dt_for_db = datetime.fromisoformat(start_time.replace("Z", "+00:00")).astimezone(BH_TZ)
+    start_at = dt_for_db.strftime("%Y-%m-%d %H:%M:%S")
+    start_date = dt_for_db.strftime("%Y-%m-%d")
 
-    # 1) cria no Google Calendar
+    # Google Calendar
     service = get_google_service()
-
     event = {
         "summary": f"[ZAIA] {client_name} ({booking_id})",
         "start": {"dateTime": start_time},
@@ -100,15 +134,16 @@ async def booking_created(request: Request):
 
     try:
         created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+    except HttpError as e:
+        raise HTTPException(status_code=400, detail=f"Google Calendar recusou o evento: {e}")
     except Exception as e:
-        # devolve erro mais claro ao invés de 500 “seco”
-        raise HTTPException(status_code=400, detail=f"Erro ao criar no Google Calendar: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao criar no Google Calendar: {e}")
 
     google_event_id = created.get("id")
     if not google_event_id:
         raise HTTPException(status_code=500, detail="Google não retornou o id do evento")
 
-    # 2) salva no Postgres
+    # Postgres
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -140,3 +175,39 @@ async def booking_created(request: Request):
     conn.close()
 
     return {"status": "created", "booking_id": booking_id, "google_event_id": google_event_id}
+
+
+@app.post("/booking-canceled")
+async def booking_canceled(request: Request):
+    data = await request.json()
+    booking_id = data.get("booking_id") or data.get("id")
+
+    if not booking_id:
+        raise HTTPException(status_code=400, detail="booking_id ausente")
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT google_event_id FROM appointments WHERE booking_id = %s", (booking_id,))
+    row = cur.fetchone()
+
+    if not row:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="booking_id não encontrado no banco")
+
+    google_event_id = row[0]
+
+    service = get_google_service()
+    try:
+        service.events().delete(calendarId=CALENDAR_ID, eventId=google_event_id).execute()
+    except HttpError:
+        pass
+
+    cur.execute("UPDATE appointments SET status = %s WHERE booking_id = %s", ("canceled", booking_id))
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    return {"status": "deleted", "booking_id": booking_id, "google_event_id": google_event_id}
