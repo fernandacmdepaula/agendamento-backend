@@ -52,6 +52,7 @@ async def booking_created(request: Request):
     if not start_time or not end_time:
         raise HTTPException(status_code=400, detail="start_time/end_time ausentes (ou start/end)")
 
+    # 1) cria no Google Calendar
     service = get_google_service()
 
     event = {
@@ -67,11 +68,11 @@ async def booking_created(request: Request):
     if not google_event_id:
         raise HTTPException(status_code=500, detail="Google não retornou o id do evento")
 
-    # salva no Postgres
+    # 2) salva no Postgres
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # IMPORTANTe: isso exige que booking_id seja UNIQUE ou PRIMARY KEY no banco
+    # precisa do booking_id com UNIQUE/PK para ON CONFLICT funcionar
     cur.execute(
         """
         INSERT INTO appointments (booking_id, google_event_id, status)
@@ -98,4 +99,29 @@ async def booking_canceled(request: Request):
     if not booking_id:
         raise HTTPException(status_code=400, detail="booking_id ausente")
 
-    return {"status": "received", "booking_id": booking_id}
+    # 1) busca no Postgres
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT google_event_id FROM appointments WHERE booking_id = %s", (booking_id,))
+    row = cur.fetchone()
+
+    if not row:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="booking_id não encontrado no banco")
+
+    google_event_id = row[0]
+
+    # 2) deleta no Google Calendar
+    service = get_google_service()
+    service.events().delete(calendarId=CALENDAR_ID, eventId=google_event_id).execute()
+
+    # 3) atualiza status
+    cur.execute("UPDATE appointments SET status = %s WHERE booking_id = %s", ("canceled", booking_id))
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    return {"status": "deleted", "booking_id": booking_id, "google_event_id": google_event_id}
