@@ -11,9 +11,6 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import psycopg2
 
-# ============================================================
-# APP + LOG
-# ============================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
@@ -65,14 +62,12 @@ def normalize_to_rfc3339(dt_str: str) -> str:
     if not s:
         return ""
 
-    # trava placeholders (quando o Zaia não substitui a variável)
     if "@data." in s or "{{" in s or "}}" in s:
         raise ValueError(f"start_time inválido (variável não renderizada): {s}")
 
     if " " in s and "T" not in s:
         s = s.replace(" ", "T", 1)
 
-    # já tem timezone?
     tail = s[10:]
     if s.endswith("Z") or ("+" in tail) or ("-" in tail and "T" in s):
         if s.endswith("Z"):
@@ -83,7 +78,6 @@ def normalize_to_rfc3339(dt_str: str) -> str:
             dt = datetime.strptime(s, "%Y-%m-%dT%H:%M%z")
         return dt.isoformat()
 
-    # sem timezone -> assume BH
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:
@@ -92,9 +86,15 @@ def normalize_to_rfc3339(dt_str: str) -> str:
     return dt.isoformat()
 
 
-# ============================================================
-# NOVO: leitura segura do body (JSON ou FORM)
-# ============================================================
+def mask_phone(p: str | None) -> str:
+    if not p:
+        return ""
+    p = str(p).strip()
+    if len(p) <= 4:
+        return "***"
+    return p[:2] + "***" + p[-2:]
+
+
 async def read_body_any(request: Request) -> dict:
     content_type = (request.headers.get("content-type") or "").lower()
     raw = await request.body()
@@ -104,11 +104,9 @@ async def read_body_any(request: Request) -> dict:
     if not raw:
         raise HTTPException(status_code=400, detail=f"Body vazio. content-type={content_type}")
 
-    # tenta JSON mesmo se content-type vier errado
     try:
         return json.loads(raw.decode("utf-8"))
     except Exception:
-        # tenta FORM
         try:
             form = await request.form()
             return dict(form)
@@ -123,10 +121,14 @@ async def health():
 
 @app.post("/booking-created")
 async def booking_created(request: Request):
-    # ✅ TROCA AQUI: não usa mais await request.json() direto
     data = await read_body_any(request)
 
-    # ✅ booking_id agora é opcional (se não vier, a gente cria)
+    # ✅ LOG: quais campos chegaram (não expõe valores)
+    try:
+        logger.info("booking-created keys=%s", list(data.keys()))
+    except Exception:
+        pass
+
     booking_id = (data.get("booking_id") or data.get("id") or "").strip()
     if not booking_id:
         booking_id = str(uuid4())
@@ -139,23 +141,27 @@ async def booking_created(request: Request):
 
     client_phone = data.get("phone") or data.get("client_phone") or data.get("telefone")
 
+    # ✅ LOG: mostra start_time e phone mascarado (para diagnosticar)
+    logger.info("booking-created start_time_raw=%s phone=%s", str(raw_start), mask_phone(client_phone))
+
     if not raw_start:
         raise HTTPException(status_code=422, detail="start_time ausente (ou start)")
 
-    # ✅ se vier placeholder, agora vira 422 com mensagem clara
     try:
         start_time = normalize_to_rfc3339(raw_start)
     except ValueError as ve:
+        # ✅ LOG do motivo
+        logger.info("booking-created normalize error=%s", str(ve))
         raise HTTPException(status_code=422, detail=str(ve))
 
     if not start_time:
         raise HTTPException(status_code=422, detail="start_time inválido")
 
-    # end_time opcional: calcula se não vier
     if raw_end:
         try:
             end_time = normalize_to_rfc3339(raw_end)
         except ValueError as ve:
+            logger.info("booking-created end_time normalize error=%s", str(ve))
             raise HTTPException(status_code=422, detail=str(ve))
         if not end_time:
             raise HTTPException(status_code=422, detail="end_time inválido")
@@ -165,12 +171,10 @@ async def booking_created(request: Request):
         dt_end = dt_start + timedelta(minutes=duration)
         end_time = dt_end.isoformat()
 
-    # salvar no banco
     dt_for_db = datetime.fromisoformat(start_time.replace("Z", "+00:00")).astimezone(BH_TZ)
     start_at = dt_for_db.strftime("%Y-%m-%d %H:%M:%S")
     start_date = dt_for_db.strftime("%Y-%m-%d")
 
-    # Google Calendar
     service = get_google_service()
     event = {
         "summary": f"[ZAIA] {client_name} ({booking_id})",
@@ -190,7 +194,6 @@ async def booking_created(request: Request):
     if not google_event_id:
         raise HTTPException(status_code=500, detail="Google não retornou o id do evento")
 
-    # Postgres
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -226,7 +229,6 @@ async def booking_created(request: Request):
 
 @app.post("/booking-canceled")
 async def booking_canceled(request: Request):
-    # aqui também pode vir body “estranho”, então usa o mesmo leitor seguro
     data = await read_body_any(request)
 
     booking_id = (data.get("booking_id") or data.get("id") or "").strip()
