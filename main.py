@@ -10,9 +10,9 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import psycopg2
 
-# -----------------------------
-# Logging
-# -----------------------------
+# ====== VERSÃO DO DEPLOY (pra provar qual código está rodando) ======
+APP_VERSION = "2026-03-05-parse-ddmmyyyy-v1"
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
@@ -20,7 +20,6 @@ app = FastAPI()
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 CALENDAR_ID = os.getenv("CALENDAR_ID", "primary")
-
 BH_TZ = timezone(timedelta(hours=-3))
 
 
@@ -59,79 +58,66 @@ def calc_duration_min(service: str) -> int:
     return 40
 
 
-def _ensure_t_separator(s: str) -> str:
-    # Converte "YYYY-MM-DD HH:MM" -> "YYYY-MM-DDTHH:MM"
-    # Converte "DD/MM/YYYY HH:MM" -> "DD/MM/YYYYTHH:MM"
-    if " " in s and "T" not in s:
-        return s.replace(" ", "T", 1)
-    return s
-
-
 def normalize_to_rfc3339(dt_str: str) -> str:
     """
-    Aceita formatos comuns vindos do Zaia:
+    Aceita:
       - YYYY-MM-DDTHH:MM
       - YYYY-MM-DDTHH:MM:SS
-      - YYYY-MM-DD HH:MM
+      - YYYY-MM-DD HH:MM(:SS)
       - DD/MM/YYYYTHH:MM
-      - DD/MM/YYYYTHH:MM:SS
-      - DD/MM/YYYY HH:MM
+      - DD/MM/YYYYTHH:MM:SS   <-- seu caso
+      - DD/MM/YYYY HH:MM(:SS)
       - com timezone: ...-03:00 / +00:00 / Z
-    Retorna ISO/RFC3339 com timezone. Se não vier timezone, assume BH (-03:00).
+    Se não vier timezone, assume BH (-03:00).
     """
     s = (dt_str or "").strip()
     if not s:
         return ""
 
-    s = _ensure_t_separator(s)
+    # Normaliza espaço -> T
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
 
-    # Caso venha com Z
+    # Z -> +00:00
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
 
-    # Se já vier com offset explícito (ex: -03:00 / +00:00)
-    # Observação: checamos apenas a "cauda" depois da data
     tail = s[10:]
     has_tz = ("+" in tail) or ("-" in tail and ":" in tail and "T" in s)
 
-    # Tentativas de parse (ordem importa)
-    parse_attempts = []
+    formats_no_tz = [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%d/%m/%YT%H:%M:%S",  # <-- seu caso
+        "%d/%m/%YT%H:%M",
+    ]
 
-    if has_tz:
-        # Com timezone no final
-        parse_attempts = [
-            ("fromisoformat", None),
-            ("strptime", "%Y-%m-%dT%H:%M:%S%z"),
-            ("strptime", "%Y-%m-%dT%H:%M%z"),
-            ("strptime", "%d/%m/%YT%H:%M:%S%z"),
-            ("strptime", "%d/%m/%YT%H:%M%z"),
-        ]
-    else:
-        # Sem timezone -> vamos assumir BH
-        parse_attempts = [
-            ("fromisoformat", None),
-            ("strptime", "%Y-%m-%dT%H:%M:%S"),
-            ("strptime", "%Y-%m-%dT%H:%M"),
-            ("strptime", "%d/%m/%YT%H:%M:%S"),
-            ("strptime", "%d/%m/%YT%H:%M"),
-        ]
+    formats_with_tz = [
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M%z",
+        "%d/%m/%YT%H:%M:%S%z",
+        "%d/%m/%YT%H:%M%z",
+    ]
 
     dt = None
-    last_err = None
 
-    for kind, fmt in parse_attempts:
-        try:
-            if kind == "fromisoformat":
-                dt = datetime.fromisoformat(s)
-            else:
-                dt = datetime.strptime(s, fmt)
-            break
-        except Exception as e:
-            last_err = e
-            dt = None
+    # tenta isoformat primeiro
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        dt = None
 
     if dt is None:
-        logger.info(f"booking-created normalize error=Falha parse start_time '{s}' err={last_err}")
+        fmts = formats_with_tz if has_tz else formats_no_tz
+        for fmt in fmts:
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except Exception:
+                dt = None
+
+    if dt is None:
+        logger.info(f"booking-created normalize error=Falha parse start_time='{s}' version={APP_VERSION}")
         return ""
 
     if not has_tz:
@@ -142,7 +128,7 @@ def normalize_to_rfc3339(dt_str: str) -> str:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": APP_VERSION}
 
 
 @app.post("/booking-created")
@@ -158,9 +144,8 @@ async def booking_created(request: Request):
 
     client_phone = data.get("phone") or data.get("client_phone") or data.get("telefone")
 
-    logger.info(f"request content-type={request.headers.get('content-type')} body_len={request.headers.get('content-length')}")
-    logger.info(f"booking-created keys={list(data.keys())}")
-    logger.info(f"booking-created start_time_raw={raw_start} phone={(client_phone or '')[:2]}***{(client_phone or '')[-2:]}")
+    logger.info(f"version={APP_VERSION} booking-created keys={list(data.keys())}")
+    logger.info(f"booking-created start_time_raw={raw_start}")
 
     if not booking_id:
         raise HTTPException(status_code=400, detail="booking_id ausente")
@@ -171,7 +156,6 @@ async def booking_created(request: Request):
     if not start_time:
         raise HTTPException(status_code=422, detail="start_time inválido")
 
-    # end_time opcional: calcula se não vier
     if raw_end:
         end_time = normalize_to_rfc3339(raw_end)
         if not end_time:
@@ -182,12 +166,10 @@ async def booking_created(request: Request):
         dt_end = dt_start + timedelta(minutes=duration)
         end_time = dt_end.isoformat()
 
-    # salvar no banco
     dt_for_db = datetime.fromisoformat(start_time.replace("Z", "+00:00")).astimezone(BH_TZ)
     start_at = dt_for_db.strftime("%Y-%m-%d %H:%M:%S")
     start_date = dt_for_db.strftime("%Y-%m-%d")
 
-    # Google Calendar
     service = get_google_service()
     event = {
         "summary": f"[ZAIA] {client_name} ({booking_id})",
@@ -207,7 +189,6 @@ async def booking_created(request: Request):
     if not google_event_id:
         raise HTTPException(status_code=500, detail="Google não retornou o id do evento")
 
-    # Postgres
     conn = get_db_connection()
     cur = conn.cursor()
 
