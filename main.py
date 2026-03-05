@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Request, HTTPException
@@ -11,7 +12,7 @@ from googleapiclient.errors import HttpError
 import psycopg2
 
 # ====== VERSÃO DO DEPLOY (pra provar qual código está rodando) ======
-APP_VERSION = "2026-03-05-parse-ddmmyyyy-v1"
+APP_VERSION = "2026-03-05-parse-ddmmyyyy-v2-autobookingid"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
@@ -60,7 +61,7 @@ def calc_duration_min(service: str) -> int:
 
 def normalize_to_rfc3339(dt_str: str) -> str:
     """
-    Aceita:
+    Aceita formatos comuns vindos do Zaia:
       - YYYY-MM-DDTHH:MM
       - YYYY-MM-DDTHH:MM:SS
       - YYYY-MM-DD HH:MM(:SS)
@@ -83,6 +84,7 @@ def normalize_to_rfc3339(dt_str: str) -> str:
         s = s[:-1] + "+00:00"
 
     tail = s[10:]
+    # detecta timezone tipo +00:00 ou -03:00
     has_tz = ("+" in tail) or ("-" in tail and ":" in tail and "T" in s)
 
     formats_no_tz = [
@@ -135,7 +137,9 @@ async def health():
 async def booking_created(request: Request):
     data = await request.json()
 
-    booking_id = data.get("booking_id") or data.get("id")
+    # ✅ Agora não depende do Zaia enviar booking_id
+    booking_id = data.get("booking_id") or data.get("id") or str(uuid.uuid4())
+
     client_name = data.get("client_name") or data.get("name") or "Cliente"
     service_name = data.get("service") or data.get("servico") or ""
 
@@ -147,8 +151,6 @@ async def booking_created(request: Request):
     logger.info(f"version={APP_VERSION} booking-created keys={list(data.keys())}")
     logger.info(f"booking-created start_time_raw={raw_start}")
 
-    if not booking_id:
-        raise HTTPException(status_code=400, detail="booking_id ausente")
     if not raw_start:
         raise HTTPException(status_code=400, detail="start_time ausente (ou start)")
 
@@ -156,6 +158,7 @@ async def booking_created(request: Request):
     if not start_time:
         raise HTTPException(status_code=422, detail="start_time inválido")
 
+    # end_time opcional: calcula se não vier
     if raw_end:
         end_time = normalize_to_rfc3339(raw_end)
         if not end_time:
@@ -166,10 +169,12 @@ async def booking_created(request: Request):
         dt_end = dt_start + timedelta(minutes=duration)
         end_time = dt_end.isoformat()
 
+    # salvar no banco (BH)
     dt_for_db = datetime.fromisoformat(start_time.replace("Z", "+00:00")).astimezone(BH_TZ)
     start_at = dt_for_db.strftime("%Y-%m-%d %H:%M:%S")
     start_date = dt_for_db.strftime("%Y-%m-%d")
 
+    # Google Calendar
     service = get_google_service()
     event = {
         "summary": f"[ZAIA] {client_name} ({booking_id})",
@@ -189,6 +194,7 @@ async def booking_created(request: Request):
     if not google_event_id:
         raise HTTPException(status_code=500, detail="Google não retornou o id do evento")
 
+    # Postgres
     conn = get_db_connection()
     cur = conn.cursor()
 
