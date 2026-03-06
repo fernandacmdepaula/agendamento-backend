@@ -12,20 +12,21 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import psycopg2
 
-# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-APP_VERSION = "2026-03-05-parse-ddmmyyyy-v3-robust"
+APP_VERSION = "2026-03-06-debug-calendar-links-v1"
 
 app = FastAPI()
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 CALENDAR_ID = os.getenv("CALENDAR_ID", "primary")
-
 BH_TZ = timezone(timedelta(hours=-3))
 
-# ---------- Helpers ----------
+_RE_ISO_YMD = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$")
+_RE_DMY = re.compile(r"^\d{2}/\d{2}/\d{4}T\d{2}:\d{2}(:\d{2})?$")
+
+
 def get_google_service():
     b64 = os.getenv("TOKEN_JSON_B64")
     if not b64 or not b64.strip():
@@ -35,6 +36,7 @@ def get_google_service():
     info = json.loads(token_str)
 
     creds = Credentials.from_authorized_user_info(info, SCOPES)
+    # cache_discovery=False evita warning e é mais estável em ambientes serverless
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
@@ -60,37 +62,28 @@ def calc_duration_min(service: str) -> int:
     return 40
 
 
-# ---------- Date parsing (robusto) ----------
-_RE_ISO_YMD = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$")
-_RE_DMY = re.compile(r"^\d{2}/\d{2}/\d{4}T\d{2}:\d{2}(:\d{2})?$")
-
-def _fail_422(msg: str):
-    raise HTTPException(status_code=422, detail=msg)
-
 def normalize_to_rfc3339(dt_str: str) -> str:
     s = (dt_str or "").strip()
     if not s:
-        _fail_422("start_time vazio")
+        raise HTTPException(status_code=422, detail="start_time vazio")
 
-    # pega erros comuns do Zaia (variável não renderizada)
     if "@data." in s or "@system" in s or "@custom" in s or "@response" in s:
-        _fail_422(f"start_time inválido (variável não renderizada): {s}")
+        raise HTTPException(status_code=422, detail=f"start_time inválido (variável não renderizada): {s}")
 
-    # troca " " por "T"
     if " " in s and "T" not in s:
         s = s.replace(" ", "T", 1)
 
-    # --- Se já tem timezone explícito (Z ou +hh:mm) ---
-    # Observação: um "-" pode aparecer na data YYYY-MM-DD, então olhamos depois do índice 10
     tail = s[10:] if len(s) > 10 else ""
-    if s.endswith("Z") or ("+" in tail) or (re.search(r"T\d{2}:\d{2}(:\d{2})?-\d{2}:\d{2}$", s) is not None):
+    has_tz = s.endswith("Z") or ("+" in tail) or (re.search(r"T\d{2}:\d{2}(:\d{2})?-\d{2}:\d{2}$", s) is not None)
+
+    if has_tz:
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
         try:
             dt = datetime.fromisoformat(s)
             return dt.isoformat()
         except ValueError:
-            # fallback raro
+            # fallback
             try:
                 dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z")
                 return dt.isoformat()
@@ -98,21 +91,16 @@ def normalize_to_rfc3339(dt_str: str) -> str:
                 dt = datetime.strptime(s, "%Y-%m-%dT%H:%M%z")
                 return dt.isoformat()
 
-    # --- Sem timezone -> assume BH ---
-    # ISO YYYY-MM-DDTHH:MM(:SS)?
     if _RE_ISO_YMD.match(s):
         try:
-            dt = datetime.fromisoformat(s)  # aceita com/sem segundos
+            dt = datetime.fromisoformat(s)
         except ValueError:
-            # fallback
             if len(s) == 16:
                 dt = datetime.strptime(s, "%Y-%m-%dT%H:%M")
             else:
                 dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
-        dt = dt.replace(tzinfo=BH_TZ)
-        return dt.isoformat()
+        return dt.replace(tzinfo=BH_TZ).isoformat()
 
-    # BR DD/MM/YYYYTHH:MM(:SS)?
     if _RE_DMY.match(s):
         try:
             if len(s) == 16:
@@ -120,69 +108,82 @@ def normalize_to_rfc3339(dt_str: str) -> str:
             else:
                 dt = datetime.strptime(s, "%d/%m/%YT%H:%M:%S")
         except ValueError as e:
-            _fail_422(f"start_time inválido (DD/MM/YYYY): {e}")
-        dt = dt.replace(tzinfo=BH_TZ)
-        return dt.isoformat()
+            raise HTTPException(status_code=422, detail=f"start_time inválido (DD/MM/YYYY): {e}")
+        return dt.replace(tzinfo=BH_TZ).isoformat()
 
-    # Último fallback: tentar ISO direto
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=BH_TZ)
         return dt.isoformat()
     except ValueError:
-        _fail_422(f"start_time inválido (formato não reconhecido): {s}")
+        raise HTTPException(status_code=422, detail=f"start_time inválido (formato não reconhecido): {s}")
 
 
-# ---------- Middleware de log ----------
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    try:
-        body = await request.body()
-        logger.info(f"request path={request.url.path} content-type={request.headers.get('content-type')} body_len={len(body)}")
-    except Exception:
-        pass
+    body = await request.body()
+    logger.info(f"request path={request.url.path} content-type={request.headers.get('content-type')} body_len={len(body)}")
     return await call_next(request)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": APP_VERSION}
+    return {"status": "ok", "version": APP_VERSION, "calendar_id": CALENDAR_ID}
+
+
+@app.get("/debug-latest")
+async def debug_latest():
+    """
+    Lista os próximos eventos do CALENDAR_ID (para confirmar se está criando no calendário certo).
+    """
+    service = get_google_service()
+    now = datetime.now(timezone.utc).isoformat()
+    resp = service.events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=now,
+        maxResults=10,
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
+
+    items = resp.get("items", [])
+    out = []
+    for ev in items:
+        out.append({
+            "id": ev.get("id"),
+            "summary": ev.get("summary"),
+            "start": ev.get("start"),
+            "end": ev.get("end"),
+            "status": ev.get("status"),
+            "htmlLink": ev.get("htmlLink"),
+        })
+
+    return {"calendar_id": CALENDAR_ID, "count": len(out), "events": out}
 
 
 @app.post("/booking-created")
 async def booking_created(request: Request):
     data = await request.json()
-
     logger.info(f"version={APP_VERSION} booking-created keys={list(data.keys())}")
 
-    # booking_id opcional -> gera automaticamente
     booking_id = (data.get("booking_id") or data.get("id") or "").strip()
     if not booking_id:
         booking_id = str(uuid.uuid4())
 
     client_name = data.get("client_name") or data.get("name") or "Cliente"
     service_name = data.get("service") or data.get("servico") or ""
-
     raw_start = data.get("start_time") or data.get("start")
     raw_end = data.get("end_time") or data.get("end")
-    client_phone = data.get("phone") or data.get("client_phone") or data.get("telefone")
+    client_phone = data.get("phone") or data.get("client_phone") or data.get("telefone") or ""
 
     if not raw_start:
         raise HTTPException(status_code=400, detail="start_time ausente (ou start)")
-    if not client_phone:
-        raise HTTPException(status_code=400, detail="phone ausente (ou client_phone/telefone)")
 
     logger.info(f"booking-created start_time_raw={raw_start}")
+    start_time = normalize_to_rfc3339(raw_start)
+    logger.info(f"booking-created normalize_ok start_time={start_time}")
 
-    try:
-        start_time = normalize_to_rfc3339(raw_start)
-        logger.info(f"booking-created normalize_ok start_time={start_time}")
-    except HTTPException as e:
-        logger.info(f"booking-created normalize_error={e.detail}")
-        raise
-
-    # end_time opcional: calcula se não vier
     if raw_end:
         end_time = normalize_to_rfc3339(raw_end)
     else:
@@ -191,12 +192,10 @@ async def booking_created(request: Request):
         dt_end = dt_start + timedelta(minutes=duration)
         end_time = dt_end.isoformat()
 
-    # salvar no banco (BH)
     dt_for_db = datetime.fromisoformat(start_time.replace("Z", "+00:00")).astimezone(BH_TZ)
     start_at = dt_for_db.strftime("%Y-%m-%d %H:%M:%S")
     start_date = dt_for_db.strftime("%Y-%m-%d")
 
-    # Google Calendar
     service = get_google_service()
     event = {
         "summary": f"[ZAIA] {client_name} ({booking_id})",
@@ -213,24 +212,19 @@ async def booking_created(request: Request):
         raise HTTPException(status_code=500, detail=f"Erro ao criar no Google Calendar: {e}")
 
     google_event_id = created.get("id")
+    html_link = created.get("htmlLink")
+    logger.info(f"booking-created google_event_id={google_event_id} calendar_id={CALENDAR_ID} htmlLink={html_link}")
+
     if not google_event_id:
         raise HTTPException(status_code=500, detail="Google não retornou o id do evento")
 
-    # Postgres
     conn = get_db_connection()
     cur = conn.cursor()
-
     cur.execute(
         """
         INSERT INTO appointments (
-            booking_id,
-            google_event_id,
-            status,
-            client_phone,
-            start_date,
-            start_at,
-            reminder_sent,
-            reminder_sent_at
+            booking_id, google_event_id, status, client_phone, start_date, start_at,
+            reminder_sent, reminder_sent_at
         )
         VALUES (%s, %s, %s, %s, %s, %s, false, NULL)
         ON CONFLICT (booking_id) DO UPDATE
@@ -242,12 +236,17 @@ async def booking_created(request: Request):
         """,
         (booking_id, google_event_id, "created", client_phone, start_date, start_at),
     )
-
     conn.commit()
     cur.close()
     conn.close()
 
-    return {"status": "created", "booking_id": booking_id, "google_event_id": google_event_id}
+    return {
+        "status": "created",
+        "booking_id": booking_id,
+        "google_event_id": google_event_id,
+        "calendar_id": CALENDAR_ID,
+        "htmlLink": html_link,
+    }
 
 
 @app.post("/booking-canceled")
@@ -260,7 +259,6 @@ async def booking_canceled(request: Request):
 
     conn = get_db_connection()
     cur = conn.cursor()
-
     cur.execute("SELECT google_event_id FROM appointments WHERE booking_id = %s", (booking_id,))
     row = cur.fetchone()
 
@@ -279,7 +277,6 @@ async def booking_canceled(request: Request):
 
     cur.execute("UPDATE appointments SET status = %s WHERE booking_id = %s", ("canceled", booking_id))
     conn.commit()
-
     cur.close()
     conn.close()
 
