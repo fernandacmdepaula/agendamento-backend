@@ -160,7 +160,42 @@ async def debug_latest():
         })
 
     return {"calendar_id": CALENDAR_ID, "count": len(out), "events": out}
+from datetime import datetime, timedelta, timezone
 
+@app.get("/debug-zaia")
+async def debug_zaia(days_back: int = 60, days_forward: int = 180, max_results: int = 50):
+    service = get_google_service()
+
+    now = datetime.now(timezone.utc)
+    time_min = (now - timedelta(days=days_back)).isoformat()
+    time_max = (now + timedelta(days=days_forward)).isoformat()
+
+    resp = service.events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=time_min,
+        timeMax=time_max,
+        q="[ZAIA]",            # procura eventos criados pelo seu sistema
+        maxResults=max_results,
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
+
+    items = resp.get("items", [])
+    return {
+        "calendar_id": CALENDAR_ID,
+        "count": len(items),
+        "events": [
+            {
+                "id": ev.get("id"),
+                "summary": ev.get("summary"),
+                "start": ev.get("start"),
+                "end": ev.get("end"),
+                "status": ev.get("status"),
+                "htmlLink": ev.get("htmlLink"),
+            }
+            for ev in items
+        ],
+    }
 
 @app.post("/booking-created")
 async def booking_created(request: Request):
@@ -281,3 +316,4 @@ async def booking_canceled(request: Request):
     conn.close()
 
     return {"status": "deleted", "booking_id": booking_id, "google_event_id": google_event_id}
+
