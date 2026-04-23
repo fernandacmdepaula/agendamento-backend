@@ -59,7 +59,9 @@ def calc_duration_min(service: str) -> int:
         return 20
     if "infantil" in s:
         return 35
-    return 40
+    if "corte" in s:
+        return 30
+    return 30
 
 
 def normalize_to_rfc3339(dt_str: str) -> str:
@@ -174,7 +176,6 @@ def is_busy_event(ev: Dict[str, Any]) -> bool:
     start = ev.get("start", {})
     end = ev.get("end", {})
 
-    # Ignora eventos de dia inteiro na barbearia
     if "date" in start or "date" in end:
         return False
 
