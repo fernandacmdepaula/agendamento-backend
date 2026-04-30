@@ -70,6 +70,58 @@ def build_event_title(client_name: str, service_name: str) -> str:
     return f"✂️ {name}"
 
 
+def validate_business_hours(start_time: str) -> None:
+    """Valida se o horário está dentro do funcionamento da barbearia."""
+    dt = datetime.fromisoformat(start_time.replace("Z", "+00:00")).astimezone(BH_TZ)
+    weekday = dt.weekday()  # 0=segunda, 6=domingo
+
+    # Domingo não abre
+    if weekday == 6:
+        raise HTTPException(
+            status_code=422,
+            detail="Horário inválido: a barbearia não abre aos domingos."
+        )
+
+    hour = dt.hour
+    minute = dt.minute
+    time_in_minutes = hour * 60 + minute
+
+    # Intervalo de almoço: 12h às 13h30
+    lunch_start = 12 * 60
+    lunch_end = 13 * 60 + 30
+
+    if lunch_start <= time_in_minutes < lunch_end:
+        raise HTTPException(
+            status_code=422,
+            detail="Horário inválido: a barbearia está fechada no intervalo de almoço (12h às 13h30)."
+        )
+
+    # Segunda a quarta: 9h às 18h
+    if weekday in [0, 1, 2]:
+        open_time = 9 * 60
+        close_time = 18 * 60
+    # Quinta e sexta: 9h às 20h
+    elif weekday in [3, 4]:
+        open_time = 9 * 60
+        close_time = 20 * 60
+    # Sábado: 9h às 17h
+    elif weekday == 5:
+        open_time = 9 * 60
+        close_time = 17 * 60
+
+    if time_in_minutes < open_time:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Horário inválido: a barbearia abre às 9h."
+        )
+
+    if time_in_minutes >= close_time:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Horário inválido: a barbearia já está fechada nesse horário."
+        )
+
+
 def normalize_to_rfc3339(dt_str: str) -> str:
     s = (dt_str or "").strip()
     if not s:
@@ -263,6 +315,7 @@ async def check_availability(request: Request):
         raise HTTPException(status_code=400, detail="start_time ausente (ou start)")
 
     start_time, end_time = build_start_end(raw_start, service_name, raw_end)
+    validate_business_hours(start_time)
     service = get_google_service()
     conflicts = find_conflicts(service, start_time, end_time)
     available = len(conflicts) == 0
@@ -297,6 +350,7 @@ async def booking_created(request: Request):
 
     logger.info("booking-created start_time_raw=%s", raw_start)
     start_time, end_time = build_start_end(raw_start, service_name, raw_end)
+    validate_business_hours(start_time)
     logger.info("booking-created normalize_ok start_time=%s end_time=%s", start_time, end_time)
 
     service = get_google_service()
