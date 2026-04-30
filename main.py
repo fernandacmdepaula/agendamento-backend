@@ -463,3 +463,134 @@ async def booking_canceled(request: Request):
         "previous_status": current_status,
         "google_delete_result": delete_result,
     }
+
+
+def get_business_hours(weekday: int):
+    """Retorna (abertura, fechamento) em minutos para o dia. None se fechado."""
+    if weekday == 6:  # domingo
+        return None
+    if weekday in [0, 1, 2]:  # seg, ter, qua
+        return (9 * 60, 18 * 60)
+    if weekday in [3, 4]:  # qui, sex
+        return (9 * 60, 20 * 60)
+    if weekday == 5:  # sábado
+        return (9 * 60, 17 * 60)
+    return None
+
+
+def get_available_slots_for_day(service_obj, date, duration_min, period=None, max_slots=3):
+    """Retorna lista de horários disponíveis (HH:MM) para um dia."""
+    weekday = date.weekday()
+    hours = get_business_hours(weekday)
+    if not hours:
+        return []
+
+    open_min, close_min = hours
+    lunch_start = 12 * 60
+    lunch_end = 13 * 60 + 30
+
+    if period:
+        p = period.lower().strip()
+        if p in ["manhã", "manha"]:
+            close_min = min(close_min, 12 * 60)
+        elif p == "tarde":
+            open_min = max(open_min, 13 * 60 + 30)
+            close_min = min(close_min, 18 * 60)
+        elif p == "noite":
+            open_min = max(open_min, 18 * 60)
+
+    day_start = date.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=BH_TZ)
+    day_end = date.replace(hour=23, minute=59, second=59, microsecond=0, tzinfo=BH_TZ)
+
+    try:
+        resp = service_obj.events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=day_start.isoformat(),
+            timeMax=day_end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=50,
+        ).execute()
+    except Exception:
+        return []
+
+    busy_intervals = []
+    for ev in resp.get("items", []):
+        if not is_busy_event(ev):
+            continue
+        ev_start = ev.get("start", {}).get("dateTime")
+        ev_end = ev.get("end", {}).get("dateTime")
+        if ev_start and ev_end:
+            try:
+                dt_s = datetime.fromisoformat(ev_start).astimezone(BH_TZ)
+                dt_e = datetime.fromisoformat(ev_end).astimezone(BH_TZ)
+                busy_intervals.append((dt_s.hour * 60 + dt_s.minute, dt_e.hour * 60 + dt_e.minute))
+            except Exception:
+                continue
+
+    slots = []
+    current = open_min
+    while current + duration_min <= close_min and len(slots) < max_slots:
+        slot_end = current + duration_min
+
+        if current < lunch_end and slot_end > lunch_start:
+            current = lunch_end
+            continue
+
+        conflict = any(current < be and slot_end > bs for bs, be in busy_intervals)
+        if not conflict:
+            slots.append(f"{current // 60:02d}:{current % 60:02d}")
+
+        current += 30
+
+    return slots
+
+
+@app.post("/available-slots")
+async def available_slots(request: Request):
+    raw_body = await request.body()
+    data = parse_json_body_or_400(raw_body)
+    logger.info("version=%s available-slots keys=%s", APP_VERSION, list(data.keys()))
+
+    service_name = data.get("service") or data.get("servico") or ""
+    raw_date = (data.get("date") or data.get("start_time") or "").strip()
+    period = data.get("period") or data.get("periodo") or None
+    max_slots = int(data.get("max_slots", 3))
+
+    if not raw_date:
+        raise HTTPException(status_code=400, detail="date ausente")
+
+    try:
+        if re.match(r"^\d{2}/\d{2}/\d{4}$", raw_date):
+            base_date = datetime.strptime(raw_date, "%d/%m/%Y")
+        elif re.match(r"^\d{4}-\d{2}-\d{2}$", raw_date):
+            base_date = datetime.strptime(raw_date, "%Y-%m-%d")
+        elif "T" in raw_date:
+            base_date = datetime.strptime(raw_date.split("T")[0], "%Y-%m-%d")
+        else:
+            raise ValueError("formato não reconhecido")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=f"date inválido: {e}")
+
+    duration_min = calc_duration_min(service_name)
+    google_service = get_google_service()
+    weekday_names = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
+
+    for delta in range(15):
+        candidate = base_date + timedelta(days=delta)
+        if candidate.weekday() == 6:
+            continue
+
+        slots = get_available_slots_for_day(google_service, candidate, duration_min, period, max_slots)
+
+        if slots:
+            return {
+                "date": candidate.strftime("%d/%m/%Y"),
+                "weekday": weekday_names[candidate.weekday()],
+                "is_requested_date": delta == 0,
+                "slots": slots,
+                "duration_minutes": duration_min,
+                "service": service_name,
+            }
+
+    raise HTTPException(status_code=404, detail="Nenhum horário disponível nos próximos 14 dias.")
